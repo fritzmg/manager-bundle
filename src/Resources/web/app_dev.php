@@ -8,57 +8,246 @@
  * @license LGPL-3.0+
  */
 
-use Contao\ManagerBundle\ContaoManager\Plugin as ManagerBundlePlugin;
-use Contao\ManagerBundle\HttpKernel\ContaoKernel;
-use Symfony\Component\Debug\Debug;
-use Symfony\Component\Dotenv\Dotenv;
-use Symfony\Component\HttpFoundation\Request;
+namespace Contao\ManagerBundle\Command;
 
-/** @var Composer\Autoload\ClassLoader */
-$loader = require __DIR__.'/../vendor/autoload.php';
+use Contao\CoreBundle\Command\AbstractLockedCommand;
+use Symfony\Component\Console\Helper\QuestionHelper;
+use Symfony\Component\Console\Input\InputArgument;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Console\Question\Question;
+use Symfony\Component\Console\Style\SymfonyStyle;
+use Symfony\Component\Filesystem\Filesystem;
+use Symfony\Component\Finder\Finder;
 
-/***********************************************************************************************/
-/*                               ###  READ FIRST  ###                                          */
-/* Access to debug front controllers must only be allowed on localhost or with authentication. */
-/* Use the "contao:install-web-dir" console command to set a password for the dev entry point. */
-/***********************************************************************************************/
+/**
+ * Installs the web entry points for Contao Managed Edition.
+ *
+ * @author Andreas Schempp <https://github.com/aschempp>
+ */
+class InstallWebDirCommand extends AbstractLockedCommand
+{
+    /**
+     * @var Filesystem
+     */
+    private $fs;
 
-if (file_exists(__DIR__.'/../.env')) {
-    (new Dotenv())->load(__DIR__.'/../.env');
-}
+    /**
+     * @var SymfonyStyle
+     */
+    private $io;
 
-$accessKey = @getenv('APP_DEV_ACCESSKEY', true);
+    /**
+     * Files that should not be copied if they exist in the web directory.
+     *
+     * @var array
+     */
+    private $optionalFiles = [
+        '.htaccess',
+    ];
 
-if (isset($_SERVER['HTTP_CLIENT_IP'])
-    || isset($_SERVER['HTTP_X_FORWARDED_FOR'])
-    || !(in_array(@$_SERVER['REMOTE_ADDR'], ['127.0.0.1', 'fe80::1', '::1']) || php_sapi_name() === 'cli-server')
-) {
-    if (false === $accessKey) {
-        header('HTTP/1.0 403 Forbidden');
-        die(sprintf('You are not allowed to access this file. Check %s for more information.', basename(__FILE__)));
+    /**
+     * Files that should not be copied on no-dev option.
+     *
+     * @var array
+     */
+    private $devFiles = [
+        'app_dev.php',
+    ];
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function configure()
+    {
+        $this
+            ->setName('contao:install-web-dir')
+            ->setDescription('Generates entry points in /web directory.')
+            ->addArgument(
+                'path',
+                InputArgument::OPTIONAL,
+                'The installation root directory (defaults to the current working directory).',
+                getcwd()
+            )
+            ->addOption(
+                'no-dev',
+                null,
+                InputOption::VALUE_NONE,
+                'Do not copy the app_dev.php entry point to the web folder.'
+            )
+            ->addOption(
+                'user',
+                'u',
+                InputOption::VALUE_REQUIRED,
+                'Username for the app_dev.php entry point.'
+            )
+            ->addOption(
+                'password',
+                'p',
+                InputOption::VALUE_OPTIONAL,
+                'Password for the app_dev.php entry point.'
+            )
+        ;
     }
 
-    if (!isset($_SERVER['PHP_AUTH_USER'], $_SERVER['PHP_AUTH_PW'])
-        || !password_verify($_SERVER['PHP_AUTH_USER'].':'.$_SERVER['PHP_AUTH_PW'], $accessKey)
-    ) {
-        header('WWW-Authenticate: Basic realm="Contao debug"');
-        header('HTTP/1.0 401 Unauthorized');
-        die(sprintf('You are not allowed to access this file. Check %s for more information.', basename(__FILE__)));
+    /**
+     * {@inheritdoc}
+     */
+    protected function interact(InputInterface $input, OutputInterface $output)
+    {
+        if (true === $input->getOption('no-dev')) {
+            return;
+        }
+
+        /** @var QuestionHelper $helper */
+        $helper = $this->getHelper('question');
+
+        if (null === $input->getOption('user')) {
+            $input->setOption(
+                'user',
+                $helper->ask($input, $output, new Question('Please enter a username:'))
+            );
+        }
+
+        $input->setOption(
+            'password',
+            $helper->ask($input, $output, (new Question('Please enter a password:'))->setHidden(true))
+        );
+
+        $user = $input->getOption('user');
+        $password = $input->getOption('password');
+
+        if (true === $input->getOption('no-dev') && (null !== $user || null !== $password)) {
+            throw new \InvalidArgumentException('Cannot set a password in no-dev mode!');
+        }
+
+        if (null === $password && null !== $user) {
+            throw new \InvalidArgumentException('Cannot set a username without password.');
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function executeLocked(InputInterface $input, OutputInterface $output)
+    {
+        $this->fs = new Filesystem();
+        $this->io = new SymfonyStyle($input, $output);
+
+        $projectDir = $input->getArgument('path');
+        $webDir = rtrim($projectDir, '/').'/web';
+
+        $this->addFiles($webDir, !$input->getOption('no-dev'));
+        $this->removeInstallPhp($webDir);
+        $this->storeAppDevAccesskey($input, $projectDir);
+
+        return 0;
+    }
+
+    /**
+     * Adds files from Resources/web to the application's web directory.
+     *
+     * @param string $webDir
+     * @param bool   $dev
+     */
+    private function addFiles($webDir, $dev = true)
+    {
+        /** @var Finder $finder */
+        $finder = Finder::create()->files()->ignoreDotFiles(false)->in(__DIR__.'/../Resources/web');
+
+        foreach ($finder as $file) {
+            if (in_array($file->getRelativePathname(), $this->optionalFiles, true)
+                && $this->fs->exists($webDir.'/'.$file->getRelativePathname())
+            ) {
+                continue;
+            }
+
+            if (!$dev && in_array($file->getRelativePathname(), $this->devFiles, true)) {
+                continue;
+            }
+
+            $this->fs->copy($file->getPathname(), $webDir.'/'.$file->getRelativePathname(), true);
+            $this->io->text(sprintf('Added/updated the <comment>web/%s</comment> file.', $file->getFilename()));
+        }
+    }
+
+    /**
+     * Removes the install.php entry point leftover from Contao <4.4.
+     *
+     * @param string $webDir
+     */
+    private function removeInstallPhp($webDir)
+    {
+        if (!file_exists($webDir.'/install.php')) {
+            return;
+        }
+
+        $this->fs->remove($webDir.'/install.php');
+        $this->io->text('Deleted the <comment>web/install.php</comment> file.');
+    }
+
+    /**
+     * Stores username and password in .env file in the project directory.
+     *
+     * @param InputInterface $input
+     * @param string         $projectDir
+     */
+    private function storeAppDevAccesskey(InputInterface $input, $projectDir)
+    {
+        $user = $input->getOption('user');
+        $password = $input->getOption('password');
+
+        if (null === $password && null === $user) {
+            return;
+        }
+
+        if (true === $input->getOption('no-dev') && (null !== $user || null !== $password)) {
+            throw new \InvalidArgumentException('Cannot set a password in no-dev mode!');
+        }
+
+        if ((null === $password && null !== $user) || (null === $user && null !== $password)) {
+            throw new \InvalidArgumentException('Must have username and password to set the access key.');
+        }
+
+        $accessKey = password_hash(
+            $input->getOption('user').':'.$input->getOption('password'),
+            PASSWORD_DEFAULT
+        );
+
+        $this->addToDotEnv($projectDir, 'APP_DEV_ACCESSKEY', $accessKey);
+    }
+
+    /**
+     * Appends value to the .env file, removing a line with the given key.
+     *
+     * @param string $projectDir
+     * @param string $key
+     * @param string $value
+     */
+    private function addToDotEnv($projectDir, $key, $value)
+    {
+        $fs = new Filesystem();
+
+        $path = $projectDir.'/.env';
+        $content = '';
+
+        if ($fs->exists($path)) {
+            $lines = file($path, FILE_IGNORE_NEW_LINES);
+
+            if (false === $lines) {
+                throw new \RuntimeException(sprintf('Could not read "%s" file.', $path));
+            }
+
+            foreach ($lines as $line) {
+                if (0 === strpos($line, $key.'=')) {
+                    continue;
+                }
+
+                $content .= $line."\n";
+            }
+        }
+
+        $fs->dumpFile($path, $content.$key.'='.escapeshellarg($value)."\n");
     }
 }
-
-unset($accessKey);
-
-Debug::enable();
-ManagerBundlePlugin::autoloadModules(__DIR__.'/../system/modules');
-
-ContaoKernel::setProjectDir(dirname(__DIR__));
-$kernel = new ContaoKernel('dev', true);
-
-Request::enableHttpMethodParameterOverride();
-
-// Handle the request
-$request = Request::createFromGlobals();
-$response = $kernel->handle($request);
-$response->send();
-$kernel->terminate($request, $response);
